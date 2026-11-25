@@ -1,0 +1,421 @@
+name: Build APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Loyiha fayllarini yaratish
+        run: |
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "mdconv"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g
+          EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.tommy.mdconv"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.tommy.mdconv"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+              packaging {
+                  resources {
+                      excludes += setOf("/META-INF/{AL2.0,LGPL2.1}", "META-INF/DEPENDENCIES")
+                  }
+              }
+          }
+
+          dependencies {
+              implementation("com.tom-roush:pdfbox-android:2.0.27.0")
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:label="MD Converter"
+                  android:allowBackup="false"
+                  android:theme="@android:style/Theme.Material.Light">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p app/src/main/java/com/tommy/mdconv
+          cat > app/src/main/java/com/tommy/mdconv/Converter.kt <<'EOF'
+          package com.tommy.mdconv
+
+          import android.content.Context
+          import android.util.Xml
+          import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
+          import com.tom_roush.pdfbox.pdmodel.PDDocument
+          import com.tom_roush.pdfbox.text.PDFTextStripper
+          import org.xmlpull.v1.XmlPullParser
+          import java.io.ByteArrayInputStream
+          import java.io.InputStream
+          import java.util.zip.ZipInputStream
+
+          object Converter {
+
+              fun pdf(ctx: Context, input: InputStream): String {
+                  PDFBoxResourceLoader.init(ctx.applicationContext)
+                  val text = PDDocument.load(input).use { doc -> PDFTextStripper().getText(doc) }
+                  return text.replace("\r\n", "\n").lines().joinToString("\n") { it.trimEnd() }.trim() + "\n"
+              }
+
+              fun docx(input: InputStream): String {
+                  var xml: ByteArray? = null
+                  ZipInputStream(input).use { zip ->
+                      while (true) {
+                          val e = zip.nextEntry ?: break
+                          if (e.name == "word/document.xml") {
+                              xml = zip.readBytes()
+                              break
+                          }
+                      }
+                  }
+                  val data = xml ?: throw IllegalArgumentException("Bu DOCX fayl emas")
+
+                  val p = Xml.newPullParser()
+                  p.setInput(ByteArrayInputStream(data), "UTF-8")
+
+                  val out = StringBuilder()
+                  val para = StringBuilder()
+                  val run = StringBuilder()
+                  val cell = StringBuilder()
+                  var row = ArrayList<String>()
+                  val rows = ArrayList<List<String>>()
+                  var style = ""
+                  var outline = -1
+                  var isList = false
+                  var level = 0
+                  var bold = false
+                  var italic = false
+                  var inTable = false
+                  var prevList = false
+
+                  fun attr(): String = p.getAttributeValue(null, "w:val") ?: ""
+
+                  fun flushRun() {
+                      val t = run.toString()
+                      run.setLength(0)
+                      val core = t.trim()
+                      if (core.isEmpty()) {
+                          para.append(t)
+                          return
+                      }
+                      val i = t.indexOf(core)
+                      val open = (if (bold) "**" else "") + (if (italic) "*" else "")
+                      val close = (if (italic) "*" else "") + (if (bold) "**" else "")
+                      para.append(t.substring(0, i)).append(open).append(core).append(close)
+                          .append(t.substring(i + core.length))
+                  }
+
+                  var ev = p.eventType
+                  while (ev != XmlPullParser.END_DOCUMENT) {
+                      if (ev == XmlPullParser.START_TAG) {
+                          when (p.name) {
+                              "w:tbl" -> { inTable = true; rows.clear() }
+                              "w:tr" -> row = ArrayList()
+                              "w:tc" -> cell.setLength(0)
+                              "w:p" -> { para.setLength(0); style = ""; outline = -1; isList = false; level = 0 }
+                              "w:pStyle" -> style = attr()
+                              "w:outlineLvl" -> outline = attr().toIntOrNull() ?: -1
+                              "w:numPr" -> isList = true
+                              "w:ilvl" -> level = attr().toIntOrNull() ?: 0
+                              "w:r" -> { bold = false; italic = false; run.setLength(0) }
+                              "w:b" -> bold = attr() != "0" && attr() != "false"
+                              "w:i" -> italic = attr() != "0" && attr() != "false"
+                              "w:t" -> run.append(p.nextText())
+                              "w:tab" -> run.append(" ")
+                              "w:br" -> run.append(" ")
+                          }
+                      } else if (ev == XmlPullParser.END_TAG) {
+                          when (p.name) {
+                              "w:r" -> flushRun()
+                              "w:tc" -> row.add(cell.toString().trim().replace("|", "\\|"))
+                              "w:tr" -> rows.add(row)
+                              "w:tbl" -> {
+                                  inTable = false
+                                  appendTable(out, rows)
+                                  prevList = false
+                              }
+                              "w:p" -> {
+                                  val text = para.toString().replace("****", "").trim()
+                                  if (inTable) {
+                                      if (text.isNotEmpty()) {
+                                          if (cell.isNotEmpty()) cell.append(" ")
+                                          cell.append(text)
+                                      }
+                                  } else if (text.isNotEmpty()) {
+                                      val h = when {
+                                          style.equals("Title", true) -> 1
+                                          style.startsWith("Heading", true) ->
+                                              style.filter { it.isDigit() }.toIntOrNull() ?: 1
+                                          outline in 0..5 -> outline + 1
+                                          else -> 0
+                                      }
+                                      if (h > 0) {
+                                          out.append("\n").append("#".repeat(minOf(h, 6))).append(" ")
+                                              .append(text.replace("**", "")).append("\n\n")
+                                          prevList = false
+                                      } else if (isList) {
+                                          out.append("  ".repeat(level)).append("- ").append(text).append("\n")
+                                          prevList = true
+                                      } else {
+                                          if (prevList) out.append("\n")
+                                          out.append(text).append("\n\n")
+                                          prevList = false
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                      ev = p.next()
+                  }
+                  return out.toString().replace(Regex("\n{3,}"), "\n\n").trim() + "\n"
+              }
+
+              private fun appendTable(out: StringBuilder, rows: List<List<String>>) {
+                  if (rows.isEmpty()) return
+                  val cols = rows.maxOf { it.size }
+                  if (cols == 0) return
+                  fun line(r: List<String>) =
+                      "| " + (0 until cols).joinToString(" | ") { r.getOrElse(it) { "" } } + " |\n"
+                  out.append("\n").append(line(rows[0]))
+                  out.append("|").append(" --- |".repeat(cols)).append("\n")
+                  for (i in 1 until rows.size) out.append(line(rows[i]))
+                  out.append("\n")
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/tommy/mdconv
+          cat > app/src/main/java/com/tommy/mdconv/MainActivity.kt <<'EOF'
+          package com.tommy.mdconv
+
+          import android.app.Activity
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Context
+          import android.content.Intent
+          import android.net.Uri
+          import android.os.Bundle
+          import android.provider.OpenableColumns
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private lateinit var status: TextView
+              private lateinit var preview: TextView
+              private lateinit var saveBtn: Button
+              private lateinit var copyBtn: Button
+              private var md = ""
+              private var baseName = "natija"
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+
+                  val root = LinearLayout(this)
+                  root.orientation = LinearLayout.VERTICAL
+                  root.setPadding(pad, pad, pad, pad)
+
+                  val pickBtn = Button(this)
+                  pickBtn.text = "PDF yoki DOCX tanlash"
+                  pickBtn.setOnClickListener { pick() }
+
+                  status = TextView(this)
+                  status.text = "Fayl tanlang"
+
+                  saveBtn = Button(this)
+                  saveBtn.text = "Saqlash (.md)"
+                  saveBtn.isEnabled = false
+                  saveBtn.setOnClickListener { save() }
+
+                  copyBtn = Button(this)
+                  copyBtn.text = "Nusxalash"
+                  copyBtn.isEnabled = false
+                  copyBtn.setOnClickListener {
+                      val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                      cm.setPrimaryClip(ClipData.newPlainText("markdown", md))
+                      Toast.makeText(this, "Nusxalandi", Toast.LENGTH_SHORT).show()
+                  }
+
+                  preview = TextView(this)
+                  preview.setTextIsSelectable(true)
+                  val scroll = ScrollView(this)
+                  scroll.addView(preview)
+
+                  root.addView(pickBtn)
+                  root.addView(status)
+                  root.addView(saveBtn)
+                  root.addView(copyBtn)
+                  root.addView(
+                      scroll,
+                      LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
+                  )
+                  setContentView(root)
+              }
+
+              private fun pick() {
+                  val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+                  i.addCategory(Intent.CATEGORY_OPENABLE)
+                  i.type = "*/*"
+                  i.putExtra(
+                      Intent.EXTRA_MIME_TYPES,
+                      arrayOf(
+                          "application/pdf",
+                          "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                      )
+                  )
+                  startActivityForResult(i, 1)
+              }
+
+              private fun save() {
+                  val i = Intent(Intent.ACTION_CREATE_DOCUMENT)
+                  i.addCategory(Intent.CATEGORY_OPENABLE)
+                  i.type = "text/markdown"
+                  i.putExtra(Intent.EXTRA_TITLE, "$baseName.md")
+                  startActivityForResult(i, 2)
+              }
+
+              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+                  super.onActivityResult(requestCode, resultCode, data)
+                  if (resultCode != RESULT_OK) return
+                  val uri = data?.data ?: return
+                  if (requestCode == 1) convert(uri) else if (requestCode == 2) write(uri)
+              }
+
+              private fun convert(uri: Uri) {
+                  val name = displayName(uri)
+                  baseName = name.substringBeforeLast('.')
+                  status.text = "O'tkazilmoqda: $name ..."
+                  saveBtn.isEnabled = false
+                  copyBtn.isEnabled = false
+                  Thread {
+                      val r = runCatching {
+                          val lower = name.lowercase()
+                          contentResolver.openInputStream(uri)!!.use { ins ->
+                              when {
+                                  lower.endsWith(".pdf") -> Converter.pdf(this@MainActivity, ins)
+                                  lower.endsWith(".docx") -> Converter.docx(ins)
+                                  else -> throw IllegalArgumentException("Faqat PDF va DOCX")
+                              }
+                          }
+                      }
+                      runOnUiThread {
+                          r.onSuccess {
+                              md = it
+                              preview.text = it.take(20000)
+                              status.text = "Tayyor: ${it.length} belgi"
+                              saveBtn.isEnabled = true
+                              copyBtn.isEnabled = true
+                          }.onFailure {
+                              status.text = "Xato: ${it.javaClass.simpleName}: ${it.message}"
+                          }
+                      }
+                  }.start()
+              }
+
+              private fun write(uri: Uri) {
+                  try {
+                      contentResolver.openOutputStream(uri, "wt")!!.use { it.write(md.toByteArray()) }
+                      Toast.makeText(this, "Saqlandi", Toast.LENGTH_SHORT).show()
+                  } catch (e: Exception) {
+                      status.text = "Saqlashda xato: ${e.message}"
+                  }
+              }
+
+              private fun displayName(uri: Uri): String {
+                  contentResolver.query(uri, null, null, null, null)?.use { c ->
+                      val i = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                      if (i >= 0 && c.moveToFirst()) return c.getString(i)
+                  }
+                  return uri.lastPathSegment ?: "fayl"
+              }
+          }
+          EOF
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: APK yigish
+        run: gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: md-converter-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Release yaratish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: APK build ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
