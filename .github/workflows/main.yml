@@ -18,8 +18,6 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
-
       - name: Loyiha fayllarini yaratish
         run: |
           cat > settings.gradle.kts <<'EOF'
